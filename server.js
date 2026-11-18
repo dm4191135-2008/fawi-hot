@@ -13,19 +13,34 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const ROOT = __dirname;
 const DATA_DIR = path.resolve(process.env.DATA_DIR || ROOT);
+const DB_FILE = path.join(DATA_DIR, 'fawi-host-db.json');
 const SITES_DIR = path.join(DATA_DIR, 'sites');
 const TEMP_DIR = path.join(DATA_DIR, 'temp');
 const MAX_UPLOAD = 100 * 1024 * 1024;
 const MAX_FILES = 500;
 const ALLOWED = new Set(['.html','.htm','.css','.js','.mjs','.json','.txt','.xml','.webmanifest','.svg','.png','.jpg','.jpeg','.gif','.webp','.avif','.ico','.woff','.woff2','.ttf','.otf','.mp4','.webm','.mp3','.pdf']);
 for (const dir of [SITES_DIR, TEMP_DIR]) fs.mkdirSync(dir, { recursive: true });
+let db = { secret: crypto.randomBytes(48).toString('hex'), users: [], oauthStates: {} };
+try { const saved = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); db = { ...db, ...saved, users: saved.users || [], oauthStates: saved.oauthStates || {} }; } catch {}
+if (!db.secret) db.secret = crypto.randomBytes(48).toString('hex');
+function saveDb() { const tmp = DB_FILE + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(db, null, 2), { mode: 0o600 }); fs.renameSync(tmp, DB_FILE); }
+saveDb();
+function sign(value) { return crypto.createHmac('sha256', db.secret).update(value).digest('base64url'); }
+function tokenFor(user) { const payload = Buffer.from(JSON.stringify({ uid: user.id, exp: Date.now() + 30 * 86400000 })).toString('base64url'); return payload + '.' + sign(payload); }
+function readToken(req) { const cookie = (req.headers.cookie || '').split(';').map(x => x.trim()).find(x => x.startsWith('fawi_session=')); if (!cookie) return null; const token = decodeURIComponent(cookie.slice('fawi_session='.length)); const [payload, signature] = token.split('.'); if (!payload || !signature) return null; const expected = sign(payload); if (signature.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return null; try { const data = JSON.parse(Buffer.from(payload, 'base64url').toString()); if (data.exp < Date.now()) return null; return db.users.find(u => u.id === data.uid) || null; } catch { return null; } }
+function setSession(req, res, user) { res.cookie('fawi_session', tokenFor(user), { httpOnly: true, secure: req.secure || process.env.NODE_ENV === 'production', sameSite: 'lax', path: '/', maxAge: 30 * 86400000 }); }
+function requireAuth(req, res, next) { req.user = readToken(req); if (!req.user) return res.status(401).json({ error: 'Inicia sessão ou cria uma conta para continuar.' }); next(); }
+function publicUser(user) { return { id: user.id, email: user.email, name: user.name || user.email.split('@')[0], provider: user.provider || 'email' }; }
+function makePassword(password) { const salt = crypto.randomBytes(16).toString('hex'); return new Promise((resolve, reject) => { crypto.scrypt(password, Buffer.from(salt, 'hex'), 64, (err, key) => { if (err) reject(err); else resolve(salt + key.toString('hex')); }); }); }
+function checkPassword(password, stored) { const salt = stored.slice(0, 32), hash = stored.slice(32); return new Promise((resolve, reject) => { crypto.scrypt(password, Buffer.from(salt, 'hex'), 64, (err, key) => { if (err) return reject(err); resolve(crypto.timingSafeEqual(key, Buffer.from(hash, 'hex'))); }); }); }
 
 app.disable('x-powered-by');
+app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
 app.use(express.json({ limit: '32kb' }));
 app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, limit: 80, standardHeaders: 'draft-7', legacyHeaders: false }));
 app.use((req, res, next) => {
-  if (/^\/(sites|temp)(\/|$)/.test(req.path) || /^\/(server\.js|package\.json|README\.md|\.gitignore)$/.test(req.path)) return res.sendStatus(404);
+  if (/^\/(sites|temp)(\/|$)/.test(req.path) || /^\/(server\.js|package\.json|README\.md|\.gitignore|fawi-host-db\.json|fawi-host-db\.json\.tmp)$/.test(req.path)) return res.sendStatus(404);
   next();
 });
 app.use(express.static(ROOT, { index: 'index.html', dotfiles: 'deny' }));
@@ -111,8 +126,41 @@ async function findUniqueId(slug) {
 function metadata(id) {
   try { return JSON.parse(fs.readFileSync(path.join(SITES_DIR, id, 'site.json'), 'utf8')); } catch { return null; }
 }
+function claimLegacySites(ownerId) {
+  if (db.users.length !== 0) return;
+  for (const entry of fs.readdirSync(SITES_DIR, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue; const info = metadata(entry.name);
+    if (info && !info.ownerId) { info.ownerId = ownerId; fs.writeFileSync(path.join(SITES_DIR, entry.name, 'site.json'), JSON.stringify(info, null, 2)); }
+  }
+}
 
-app.post('/api/publish', upload.array('files', MAX_FILES), async (req, res) => {
+
+app.get('/api/auth/me', (req, res) => { const user = readToken(req); res.json({ user: user ? publicUser(user) : null }); });
+app.post('/api/auth/register', async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase(); const password = String(req.body.password || ''); const name = String(req.body.name || '').trim().slice(0, 80);
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Indica um email válido.' });
+  if (password.length < 8) return res.status(400).json({ error: 'A senha deve ter pelo menos 8 caracteres.' });
+  if (db.users.some(u => u.email === email)) return res.status(409).json({ error: 'Este email já tem uma conta. Inicia sessão.' });
+  const user = { id: crypto.randomUUID(), email, name: name || email.split('@')[0], provider: 'email', passwordHash: await makePassword(password), createdAt: new Date().toISOString() };
+  claimLegacySites(user.id); db.users.push(user); saveDb(); setSession(req, res, user); res.status(201).json({ user: publicUser(user) });
+});
+app.post('/api/auth/login', async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase(), password = String(req.body.password || ''); const user = db.users.find(u => u.email === email && u.passwordHash);
+  if (!user || !(await checkPassword(password, user.passwordHash))) return res.status(401).json({ error: 'Email ou senha incorretos.' });
+  setSession(req, res, user); res.json({ user: publicUser(user) });
+});
+app.post('/api/auth/logout', (_req, res) => { res.clearCookie('fawi_session', { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', path: '/' }); res.json({ success: true }); });
+app.get('/api/auth/google', (req, res) => {
+  if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) return res.status(503).send('Login Google ainda não configurado. Define GOOGLE_CLIENT_ID e GOOGLE_CLIENT_SECRET no servidor.');
+  const state = crypto.randomBytes(24).toString('hex'); db.oauthStates[state] = Date.now() + 10 * 60 * 1000; saveDb();
+  const redirectUri = `${req.protocol}://${req.get('host')}/api/auth/google/callback`; const params = new URLSearchParams({ client_id: process.env.GOOGLE_CLIENT_ID, redirect_uri: redirectUri, response_type: 'code', scope: 'openid email profile', state }); res.redirect('https://accounts.google.com/o/oauth2/v2/auth?' + params.toString());
+});
+app.get('/api/auth/google/callback', async (req, res) => {
+  const state = String(req.query.state || ''); if (!db.oauthStates[state] || db.oauthStates[state] < Date.now()) { delete db.oauthStates[state]; saveDb(); return res.status(400).send('Pedido de autenticação inválido ou expirado.'); } delete db.oauthStates[state]; saveDb();
+  try { const redirectUri = `${req.protocol}://${req.get('host')}/api/auth/google/callback`; const tokenResp = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ code: String(req.query.code || ''), client_id: process.env.GOOGLE_CLIENT_ID || '', client_secret: process.env.GOOGLE_CLIENT_SECRET || '', redirect_uri: redirectUri, grant_type: 'authorization_code' }) }); const tokens = await tokenResp.json(); if (!tokenResp.ok || !tokens.access_token) throw new Error('Não foi possível validar o Google.'); const profileResp = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', { headers: { authorization: `Bearer ${tokens.access_token}` } }); const profile = await profileResp.json(); if (!profile.email || profile.verified_email !== true) throw new Error('O Google não confirmou o email.'); let user = db.users.find(u => u.googleId === profile.id || u.email === String(profile.email).toLowerCase()); if (!user) { user = { id: crypto.randomUUID(), email: String(profile.email).toLowerCase(), name: profile.name || profile.email.split('@')[0], googleId: profile.id, provider: 'google', createdAt: new Date().toISOString() }; claimLegacySites(user.id); db.users.push(user); } else { user.googleId = profile.id; user.provider = 'google'; user.name = profile.name || user.name; } saveDb(); setSession(req, res, user); res.redirect('/publish.html?auth=success'); } catch (e) { res.status(400).send(e.message || 'Falha no login Google.'); }
+});
+
+app.post('/api/publish', requireAuth, upload.array('files', MAX_FILES), async (req, res) => {
   const files = req.files || [];
   let workDir;
   try {
@@ -156,7 +204,7 @@ app.post('/api/publish', upload.array('files', MAX_FILES), async (req, res) => {
     const finalDir = path.join(SITES_DIR, id);
     await fs.promises.rename(workDir, finalDir);
     workDir = null;
-    const info = { id, name: projectName, createdAt: new Date().toISOString(), files: countFiles(finalDir) };
+    const info = { id, name: projectName, ownerId: req.user.id, createdAt: new Date().toISOString(), files: countFiles(finalDir) };
     await fs.promises.writeFile(path.join(finalDir, 'site.json'), JSON.stringify(info, null, 2));
     res.status(201).json({ success: true, site: info, url: `/s/${id}/` });
   } catch (err) {
@@ -175,20 +223,20 @@ function countFiles(dir) {
   return n;
 }
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
-app.get('/api/sites', (_req, res) => {
+app.get('/api/sites', requireAuth, (req, res) => {
   const sites = [];
   for (const entry of fs.readdirSync(SITES_DIR, { withFileTypes: true })) {
-    if (entry.isDirectory()) { const data = metadata(entry.name); if (data) sites.push(data); }
+    if (entry.isDirectory()) { const data = metadata(entry.name); if (data && data.ownerId === req.user.id) sites.push(data); }
   }
   sites.sort((a,b) => b.createdAt.localeCompare(a.createdAt));
   res.json({ sites });
 });
-app.delete('/api/sites/:id', async (req, res) => {
+app.delete('/api/sites/:id', requireAuth, async (req, res) => {
   const id = req.params.id;
   if (!/^[a-z0-9-]{1,64}$/.test(id)) return res.status(400).json({ error: 'Identificador inválido.' });
   const target = path.resolve(SITES_DIR, id);
   if (!target.startsWith(path.resolve(SITES_DIR) + path.sep)) return res.status(400).json({ error: 'Caminho inválido.' });
-  try { await fs.promises.rm(target, { recursive: true, force: true }); res.json({ success: true }); }
+  try { const info = metadata(id); if (!info || info.ownerId !== req.user.id) return res.status(404).json({ error: 'Projeto não encontrado.' }); await fs.promises.rm(target, { recursive: true, force: true }); res.json({ success: true }); }
   catch { res.status(500).json({ error: 'Não foi possível apagar o projeto.' }); }
 });
 app.get('/s/:id/*', (req, res, next) => {

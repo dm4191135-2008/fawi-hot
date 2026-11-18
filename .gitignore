@@ -5,3 +5,6 @@ sites/*
 temp/*
 !temp/.gitkeep
 .DS_Store
+
+fawi-host-db.json
+fawi-host-db.json.tmp

@@ -29,21 +29,33 @@ São aceites ficheiros HTML, CSS, JS/MJS, JSON, imagens, fontes, PDF, áudio/ví
 3. Runtime: Node.
 4. Build command: `npm install`
 5. Start command: `npm start`
-6. Adiciona um **Persistent Disk** ao serviço, por exemplo com mount path `/var/data`.
+6. Adiciona um **Persistent Disk** ao serviço, com mount path `/var/data`.
 7. Em Environment, define `DATA_DIR=/var/data`.
-8. Faz deploy.
+8. Para ativar o Google login, cria credenciais OAuth 2.0 do tipo Web no Google Cloud e define `GOOGLE_CLIENT_ID` e `GOOGLE_CLIENT_SECRET`. Regista também o URI de redirecionamento `https://TEU-DOMINIO/api/auth/google/callback` nas credenciais.
+9. Faz deploy.
 
-O diretório `DATA_DIR` conterá `sites/` e `temp/`. Sem Persistent Disk, os sites publicados podem desaparecer num novo deploy/restart/instância. O disco persistente do Render é normalmente associado a uma única instância; dimensiona o serviço e a política de backups de acordo com o uso.
+O diretório `DATA_DIR` conterá `sites/`, `temp/` e o ficheiro `fawi-host-db.json` (contas e dados de associação dos projetos). Sem Persistent Disk, os sites e contas podem desaparecer num novo deploy/restart/instância. O disco persistente do Render é normalmente associado a uma única instância; dimensiona o serviço e a política de backups de acordo com o uso.
 
 ## PWA / instalação
 A plataforma inclui `manifest.webmanifest`, ícones PNG, service worker e um menu flutuante inferior em ecrãs móveis. Depois de publicar com HTTPS, abre o endereço no Chrome e escolhe **Instalar app** ou **Adicionar ao ecrã principal**. A disponibilidade do prompt depende do navegador e dos critérios de instalação PWA. A aplicação instalada continua a precisar de ligação à internet para publicar e consultar projetos.
 
 ## Endpoints
 - `GET /health` — verificação simples de disponibilidade
-- `GET /api/sites` — lista publicações
-- `POST /api/publish` — recebe `projectName` e ficheiros multipart no campo `files`
-- `DELETE /api/sites/:id` — remove um site
+- `GET /api/auth/me` — verifica a sessão atual
+- `POST /api/auth/register` — cria conta com email e senha
+- `POST /api/auth/login` — inicia sessão
+- `POST /api/auth/logout` — encerra sessão
+- `GET /api/auth/google` e callback — autenticação Google OAuth (requer credenciais)
+- `GET /api/sites` — lista apenas os projetos da conta autenticada
+- `POST /api/publish` — publica ficheiros, associando o projeto à conta autenticada
+- `DELETE /api/sites/:id` — remove apenas um projeto pertencente à conta autenticada
 - `GET /s/:id/` — serve o site publicado
+
+## Contas e projetos
+- A FAWI HOST inclui registo e login com email/senha (senhas protegidas por scrypt) e sessão em cookie HttpOnly.
+- Cada publicação fica associada ao utilizador; a lista e a remoção verificam a propriedade.
+- A base de dados JSON e os sites devem estar no Persistent Disk do Render via `DATA_DIR`.
+- Google login só funciona após configuração de `GOOGLE_CLIENT_ID` e `GOOGLE_CLIENT_SECRET` no Render.
 
 ## Segurança e limitações desta V1
 - Upload limitado a 100 MB e 500 ficheiros.
@@ -51,7 +63,7 @@ A plataforma inclui `manifest.webmanifest`, ícones PNG, service worker e um men
 - Extração ZIP com validação de caminhos, limite de quantidade e tamanho descomprimido.
 - Identificadores únicos para evitar colisões.
 - Os sites são servidos sob `/s/:id/` com uma política CSP `sandbox` para reduzir o acesso do conteúdo publicado à origem do painel.
-- Não existe autenticação, quotas por utilizador, pagamentos, domínio personalizado, HTTPS próprio por projeto, CDN, antivírus, nem proteção anti-abuso avançada. O painel é, nesta versão, uma instância partilhada: qualquer pessoa com acesso ao serviço pode ver e apagar publicações. **Não uses esta V1 para dados privados ou produção comercial sem acrescentar autenticação, autorização, quotas e monitorização.**
+- Não existe verificação de email, recuperação de senha, quotas por utilizador, pagamentos, domínio personalizado, CDN, antivírus ou proteção anti-abuso avançada. Configura Google OAuth e backups do Persistent Disk antes de uso público amplo.
 - Para sites que dependem de cookies, service workers próprios, APIs específicas de origem ou integrações que exigem mesma origem, a política sandbox pode limitar funcionalidades. A arquitetura de produção recomendada é servir cada site num domínio/subdomínio isolado.
 
 ## Estrutura
