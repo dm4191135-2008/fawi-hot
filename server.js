@@ -15,7 +15,7 @@ const ROOT = __dirname;
 const DATA_DIR = path.resolve(process.env.DATA_DIR || ROOT);
 const SITES_DIR = path.join(DATA_DIR, 'sites');
 const TEMP_DIR = path.join(DATA_DIR, 'temp');
-const MAX_UPLOAD = 50 * 1024 * 1024;
+const MAX_UPLOAD = 100 * 1024 * 1024;
 const MAX_FILES = 500;
 const ALLOWED = new Set(['.html','.htm','.css','.js','.mjs','.json','.txt','.xml','.webmanifest','.svg','.png','.jpg','.jpeg','.gif','.webp','.avif','.ico','.woff','.woff2','.ttf','.otf','.mp4','.webm','.mp3','.pdf']);
 for (const dir of [SITES_DIR, TEMP_DIR]) fs.mkdirSync(dir, { recursive: true });
@@ -83,7 +83,7 @@ function extractZip(zipPath, destRoot) {
           allowedFile(name);
           const dest = safeJoin(destRoot, name);
           total += entry.uncompressedSize || 0;
-          if (total > MAX_UPLOAD) throw new Error('O conteúdo extraído ultrapassa 50 MB.');
+          if (total > MAX_UPLOAD) throw new Error('O conteúdo extraído ultrapassa 100 MB.');
           fs.promises.mkdir(path.dirname(dest), { recursive: true }).then(() => {
             zip.openReadStream(entry, (streamErr, stream) => {
               if (streamErr) return fail(streamErr);
@@ -101,11 +101,12 @@ async function removeFiles(files) {
   await Promise.all((files || []).map(f => fs.promises.rm(f.path, { force: true }).catch(() => {})));
 }
 async function findUniqueId(slug) {
-  for (let i = 0; i < 5; i++) {
-    const id = `${slug}-${crypto.randomBytes(3).toString('hex')}`;
+  const base = cleanName(slug);
+  for (let suffix = 1; suffix < 10000; suffix++) {
+    const id = suffix === 1 ? base : `${base}-${suffix}`;
     try { await fs.promises.access(path.join(SITES_DIR, id)); } catch { return id; }
   }
-  return `${slug}-${crypto.randomUUID().slice(0,8)}`;
+  return `${base}-${crypto.randomUUID().slice(0,8)}`;
 }
 function metadata(id) {
   try { return JSON.parse(fs.readFileSync(path.join(SITES_DIR, id, 'site.json'), 'utf8')); } catch { return null; }
@@ -117,7 +118,7 @@ app.post('/api/publish', upload.array('files', MAX_FILES), async (req, res) => {
   try {
     if (!files.length) return res.status(400).json({ error: 'Seleciona os ficheiros do site ou um ZIP.' });
     const totalUploadSize = files.reduce((sum, file) => sum + (file.size || 0), 0);
-    if (totalUploadSize > MAX_UPLOAD) throw new Error('O envio ultrapassa o limite total de 50 MB.');
+    if (totalUploadSize > MAX_UPLOAD) throw new Error('O envio ultrapassa o limite total de 100 MB.');
     const projectName = cleanName(req.body.projectName);
     workDir = await fs.promises.mkdtemp(path.join(TEMP_DIR, 'publish-'));
     const zipFiles = files.filter(f => path.extname(f.originalname).toLowerCase() === '.zip');
@@ -142,7 +143,15 @@ app.post('/api/publish', upload.array('files', MAX_FILES), async (req, res) => {
         indexPath = path.join(workDir, 'index.html');
       }
     }
-    if (!fs.existsSync(indexPath)) throw new Error('Não foi encontrado um index.html na raiz do site.');
+    if (!fs.existsSync(indexPath)) {
+      const rootHtml = (await fs.promises.readdir(workDir, { withFileTypes: true }))
+        .filter(entry => entry.isFile() && /\.html?$/i.test(entry.name))
+        .sort((a, b) => a.name.localeCompare(b.name))[0];
+      if (rootHtml) {
+        await fs.promises.rename(path.join(workDir, rootHtml.name), indexPath);
+      }
+    }
+    if (!fs.existsSync(indexPath)) throw new Error('Não foi encontrado um ficheiro HTML na raiz do site.');
     const id = await findUniqueId(projectName);
     const finalDir = path.join(SITES_DIR, id);
     await fs.promises.rename(workDir, finalDir);

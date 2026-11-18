@@ -15,13 +15,13 @@ npm start
 Abre `http://localhost:3000`.
 
 ## Publicar um site
-1. Prepara um site estático com `index.html` na raiz.
+1. Prepara um site estático com um ficheiro HTML na raiz (se não se chamar `index.html`, a FAWI HOST usa-o como página inicial).
 2. No painel FAWI HOST, escreve o nome do projeto.
 3. Seleciona os ficheiros, uma pasta completa ou um ZIP.
 4. Clica em **Publicar site**.
 5. O endereço público será apresentado na lista de sites publicados.
 
-São aceites ficheiros HTML, CSS, JS/MJS, JSON, imagens, fontes, PDF, áudio/vídeo e outros recursos estáticos comuns. Limite total de upload: 50 MB e 500 ficheiros por publicação. O envio de pastas preserva a estrutura de subpastas. ZIPs são extraídos no servidor e os caminhos são validados para impedir ZIP Slip. Não são aceites ficheiros de servidor como PHP, Node ou executáveis.
+São aceites ficheiros HTML, CSS, JS/MJS, JSON, imagens, fontes, PDF, áudio/vídeo e outros recursos estáticos comuns. Limite total de upload: 100 MB e 500 ficheiros por publicação. Os ZIPs preservam a estrutura de subpastas. ZIPs são extraídos no servidor e os caminhos são validados para impedir ZIP Slip. Não são aceites ficheiros de servidor como PHP, Node ou executáveis.
 
 ## Deploy no Render
 1. Envia este projeto para um repositório Git.
@@ -46,7 +46,7 @@ A plataforma inclui `manifest.webmanifest`, ícones PNG, service worker e um men
 - `GET /s/:id/` — serve o site publicado
 
 ## Segurança e limitações desta V1
-- Upload limitado a 50 MB e 500 ficheiros.
+- Upload limitado a 100 MB e 500 ficheiros.
 - Lista de extensões estáticas permitidas; caminhos normalizados e validados.
 - Extração ZIP com validação de caminhos, limite de quantidade e tamanho descomprimido.
 - Identificadores únicos para evitar colisões.
