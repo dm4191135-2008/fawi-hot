@@ -94,3 +94,9 @@ A interface está dividida em páginas independentes:
 - `about.html` — saber mais / como funciona
 
 Para pré-visualizar o aspeto, abre `index.html` diretamente no computador. Para testar uploads, gestão de sites e publicação, inicia o servidor com `npm install` e `npm start` e abre `http://localhost:3000`.
+
+## FAWI Smart Security
+
+Uploads are screened before publication using static, heuristic indicators in HTML, JavaScript, CSS, JSON, SVG, XML and TXT files. High-confidence patterns block publishing; suspicious indicators produce a review warning. Published projects can be re-scanned from the projects list. A project marked blocked is not served publicly.
+
+This is a heuristic check, **not an AI malware detector and not a guarantee of safety**. It can miss harmful content and may flag legitimate forms or scripts. It does not currently query Google Safe Browsing/Web Risk or other external reputation services. The owner should inspect review findings and request a Google Search Console review only after remediation.

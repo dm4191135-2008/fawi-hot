@@ -160,6 +160,39 @@ app.get('/api/auth/google/callback', async (req, res) => {
   try { const redirectUri = `${req.protocol}://${req.get('host')}/api/auth/google/callback`; const tokenResp = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ code: String(req.query.code || ''), client_id: process.env.GOOGLE_CLIENT_ID || '', client_secret: process.env.GOOGLE_CLIENT_SECRET || '', redirect_uri: redirectUri, grant_type: 'authorization_code' }) }); const tokens = await tokenResp.json(); if (!tokenResp.ok || !tokens.access_token) throw new Error('Não foi possível validar o Google.'); const profileResp = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', { headers: { authorization: `Bearer ${tokens.access_token}` } }); const profile = await profileResp.json(); if (!profile.email || profile.verified_email !== true) throw new Error('O Google não confirmou o email.'); let user = db.users.find(u => u.googleId === profile.id || u.email === String(profile.email).toLowerCase()); if (!user) { user = { id: crypto.randomUUID(), email: String(profile.email).toLowerCase(), name: profile.name || profile.email.split('@')[0], googleId: profile.id, picture: profile.picture || null, provider: 'google', createdAt: new Date().toISOString() }; claimLegacySites(user.id); db.users.push(user); } else { user.googleId = profile.id; user.provider = 'google'; user.name = profile.name || user.name; user.picture = profile.picture || user.picture || null; } saveDb(); setSession(req, res, user); res.redirect('/publish.html?auth=success'); } catch (e) { res.status(400).send(e.message || 'Falha no login Google.'); }
 });
 
+// FAWI Smart Security: heuristic static-content screening (not a malware guarantee).
+const SCAN_TEXT_EXTS = new Set(['.html','.htm','.js','.mjs','.json','.svg','.xml','.txt','.css']);
+async function scanSite(root) {
+  const findings = []; let scanned = 0, bytes = 0;
+  async function walk(dir) {
+    for (const entry of await fs.promises.readdir(dir, { withFileTypes: true })) {
+      if (entry.name === 'site.json') continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) { await walk(full); continue; }
+      const ext = path.extname(entry.name).toLowerCase();
+      if (!SCAN_TEXT_EXTS.has(ext)) continue;
+      const stat = await fs.promises.stat(full);
+      if (!stat.isFile() || stat.size > 1024 * 1024 || bytes + stat.size > 8 * 1024 * 1024) continue;
+      const text = await fs.promises.readFile(full, 'utf8'); scanned++; bytes += stat.size;
+      const content = text.toLowerCase();
+      const hasPassword = /type\s*=\s*["']password["']|autocomplete\s*=\s*["']current-password["']/.test(content);
+      const externalForm = /<form[^>]{0,1000}action\s*=\s*["']https?:\/\//i.test(text);
+      const branded = /google|microsoft|apple|paypal|facebook|instagram|bank|banco|outlook|gmail/.test(content);
+      const loginWords = /sign[ -]?in|log[ -]?in|login|entrar|iniciar sess[aã]o|password|senha|verify your account|verificar conta/.test(content);
+      if (hasPassword && externalForm && branded && loginWords) findings.push({ level: 'block', code: 'credential-brand-external', message: `Formulário de senha ligado a uma marca conhecida e enviado para endereço externo (${entry.name}).` });
+      if (hasPassword && externalForm) findings.push({ level: 'review', code: 'external-password-form', message: `Formulário de senha envia dados para endereço externo (${entry.name}).` });
+      if (/eval\s*\(\s*(atob|decodeURIComponent)/i.test(text) || (/eval\s*\(/i.test(text) && /atob\s*\(/i.test(text))) findings.push({ level: 'block', code: 'obfuscated-script', message: `Script com combinação de execução e descodificação de código (${entry.name}).` });
+      if (/<iframe[^>]+(?:display\s*:\s*none|width\s*=\s*["']0|height\s*=\s*["']0)[^>]*src\s*=\s*["']https?:/i.test(text)) findings.push({ level: 'review', code: 'hidden-external-frame', message: `Iframe externo oculto detetado (${entry.name}).` });
+      if (hasPassword && /(addEventListener\s*\(\s*["']key(?:down|up|press)["']|onkey(?:down|up|press)\s*=)/i.test(text) && /(fetch\s*\(|xmlhttprequest|navigator\.sendbeacon)/i.test(text)) findings.push({ level: 'block', code: 'credential-capture-pattern', message: `Código combina campo de senha, captura de teclas e envio de dados (${entry.name}).` });
+      if (/(window\.location|location\.href)\s*=\s*["']https?:/i.test(text) && hasPassword) findings.push({ level: 'review', code: 'credential-redirect', message: `Redirecionamento externo associado a campo de senha (${entry.name}).` });
+    }
+  }
+  await walk(root);
+  const unique = [...new Map(findings.map(f => [f.code + f.message, f])).values()];
+  const status = unique.some(f => f.level === 'block') ? 'blocked' : unique.length ? 'review' : 'safe';
+  return { status, scannedFiles: scanned, checkedAt: new Date().toISOString(), findings: unique.slice(0, 20), note: 'Análise automática por indicadores; não garante que o site seja seguro nem substitui revisão humana.' };
+}
+
 app.post('/api/publish', requireAuth, upload.array('files', MAX_FILES), async (req, res) => {
   const files = req.files || [];
   let workDir;
@@ -200,13 +233,15 @@ app.post('/api/publish', requireAuth, upload.array('files', MAX_FILES), async (r
       }
     }
     if (!fs.existsSync(indexPath)) throw new Error('Não foi encontrado um ficheiro HTML na raiz do site.');
+    const security = await scanSite(workDir);
+    if (security.status === 'blocked') return res.status(422).json({ error: 'A análise de segurança bloqueou a publicação. Corrige os indicadores encontrados e tenta novamente.', security });
     const id = await findUniqueId(projectName);
     const finalDir = path.join(SITES_DIR, id);
     await fs.promises.rename(workDir, finalDir);
     workDir = null;
-    const info = { id, name: projectName, ownerId: req.user.id, createdAt: new Date().toISOString(), files: countFiles(finalDir) };
+    const info = { id, name: projectName, ownerId: req.user.id, createdAt: new Date().toISOString(), files: countFiles(finalDir), security };
     await fs.promises.writeFile(path.join(finalDir, 'site.json'), JSON.stringify(info, null, 2));
-    res.status(201).json({ success: true, site: info, url: `/s/${id}/` });
+    res.status(201).json({ success: true, site: info, security, url: `/s/${id}/` });
   } catch (err) {
     res.status(400).json({ error: err.message || 'Não foi possível publicar o site.' });
   } finally {
@@ -231,6 +266,12 @@ app.get('/api/sites', requireAuth, (req, res) => {
   sites.sort((a,b) => b.createdAt.localeCompare(a.createdAt));
   res.json({ sites });
 });
+app.post('/api/sites/:id/security-check', requireAuth, async (req, res) => {
+  const id = req.params.id; if (!/^[a-z0-9-]{1,64}$/.test(id)) return res.status(400).json({ error: 'Identificador inválido.' });
+  const dir = path.resolve(SITES_DIR, id); const info = metadata(id);
+  if (!info || info.ownerId !== req.user.id || !dir.startsWith(path.resolve(SITES_DIR) + path.sep)) return res.status(404).json({ error: 'Projeto não encontrado.' });
+  try { info.security = await scanSite(dir); await fs.promises.writeFile(path.join(dir, 'site.json'), JSON.stringify(info, null, 2)); res.json({ success: true, security: info.security }); } catch { res.status(500).json({ error: 'Não foi possível analisar o site.' }); }
+});
 app.delete('/api/sites/:id', requireAuth, async (req, res) => {
   const id = req.params.id;
   if (!/^[a-z0-9-]{1,64}$/.test(id)) return res.status(400).json({ error: 'Identificador inválido.' });
@@ -244,6 +285,7 @@ app.get('/s/:id/*', (req, res, next) => {
   if (!/^[a-z0-9-]{1,64}$/.test(id)) return res.sendStatus(404);
   const root = path.resolve(SITES_DIR, id);
   if (!root.startsWith(path.resolve(SITES_DIR) + path.sep) || !fs.existsSync(path.join(root, 'index.html'))) return res.sendStatus(404);
+  const siteInfo = metadata(id); if (siteInfo && siteInfo.security && siteInfo.security.status === 'blocked') return res.status(451).send('Este site foi temporariamente bloqueado pela verificação de segurança FAWI HOST.');
   // Uploaded pages run in a browser sandbox to isolate them from the FAWI HOST dashboard/API origin.
   res.setHeader('Content-Security-Policy', "sandbox allow-scripts allow-forms allow-popups; default-src 'self' data: blob: https: http:; img-src * data: blob:; style-src * 'unsafe-inline'; script-src * 'unsafe-inline' 'unsafe-eval'; connect-src *");
   const rel = req.params[0] || 'index.html';
